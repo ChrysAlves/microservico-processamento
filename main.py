@@ -1,0 +1,174 @@
+import os
+import json
+import time
+import hashlib
+import subprocess
+import requests
+from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable
+
+# --- Configurações ---
+KAFKA_BROKER = os.environ.get('KAFKA_BROKER', 'kafka:29092')
+KAFKA_CONSUMER_TOPIC = 'ingest-requests'
+GROUP_ID = 'processing-group'
+NORMALIZED_OUTPUT_DIR = '/app/output_normalizado'
+SIP_LOCATION_INSIDE_CONTAINER = '/app/temp_ingestao_sip'
+MAPOTECA_SERVICE_URL = "http://mapoteca_app:3000/internal/processing-complete"
+GESTAO_DADOS_URL = "http://gestao_dados_app:8000"
+
+EXTENSION_MAP = {
+    '.pdf': 'pdf', '.doc': 'doc', '.docx': 'docx', '.odt': 'odt',
+    '.txt': 'txt', '.xml': 'xml', '.rtf': 'rtf', '.jpg': 'jpg',
+    '.jpeg': 'jpg', '.png': 'png', '.gif': 'gif', '.dwg': 'dwg',
+}
+DOCUMENT_FORMATS_TO_CONVERT = ['pdf', 'doc', 'docx', 'odt', 'txt', 'xml', 'rtf']
+
+print("--- Microsserviço de Processamento ---")
+
+# --- Funções Auxiliares ---
+def calculate_checksum(file_path):
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        print(f"       ERRO ao calcular checksum: {e}")
+        return None
+
+def identify_format_by_extension(filename):
+    extension = os.path.splitext(filename)[1].lower()
+    return EXTENSION_MAP.get(extension, 'outro')
+
+def normalize_to_pdfa(file_path, output_dir):
+    try:
+        print(f"       - Normalizando documento para PDF/A...")
+        command = ["libreoffice", "--headless", "--convert-to", "pdf:writer_pdf_Export:SelectPdfVersion=1", "--outdir", output_dir, file_path]
+        subprocess.run(command, check=True, timeout=90, capture_output=True, text=True)
+        base_name = os.path.splitext(os.path.basename(file_path))[0] + ".pdf"
+        normalized_path = os.path.join(output_dir, base_name)
+        print(f"       - SUCESSO: Documento normalizado salvo como: {normalized_path}")
+        return normalized_path
+    except Exception as e:
+        print(f"       ERRO ao normalizar para PDF/A: {e}")
+        return None
+
+def notificar_mapoteca(metadados: dict):
+    try:
+        print(f"     -> Notificando Mapoteca em {MAPOTECA_SERVICE_URL}...")
+        response = requests.post(MAPOTECA_SERVICE_URL, json=metadados, timeout=15)
+        response.raise_for_status()
+        print(f"     -> SUCESSO: Mapoteca notificado!")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"     -> ERRO CRÍTICO: Falha ao notificar o Mapoteca: {e}")
+        return False
+
+def enviar_metadados_para_gestao(payload_aip: dict):
+    try:
+        url = f"{GESTAO_DADOS_URL}/aips/"
+        print(f"     -> Enviando metadados do AIP para {url}...")
+        response = requests.post(url, json=payload_aip, timeout=15)
+        if response.status_code == 201:
+            print(f"     -> SUCESSO: Metadados do AIP registrados!")
+            return True
+        else:
+            print(f"     -> ERRO: Falha ao registrar metadados. Status: {response.status_code}, Resposta: {response.text}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"     -> ERRO DE CONEXÃO: Não foi possível se conectar ao serviço de Gestão de Dados: {e}")
+        return False
+
+# --- Lógica de Conexão ---
+consumer = None
+while consumer is None:
+    try:
+        print("Tentando se conectar ao Kafka...")
+        consumer = KafkaConsumer(
+            KAFKA_CONSUMER_TOPIC,
+            bootstrap_servers=[KAFKA_BROKER],
+            auto_offset_reset='earliest',
+            group_id=GROUP_ID,
+            value_deserializer=lambda v: json.loads(v.decode('utf-8'))
+        )
+        print(">>> Conectado ao Kafka! Aguardando tarefas... <<<")
+    except NoBrokersAvailable:
+        print("Kafka indisponível. Tentando novamente em 10s...")
+        time.sleep(10)
+
+# --- Loop Principal ---
+for message in consumer:
+    try:
+        data = message.value
+        transfer_id = data.get('transferId')
+        sip_directory = os.path.join(SIP_LOCATION_INSIDE_CONTAINER, transfer_id)
+        
+        print(f"\n[*] Nova tarefa! Processando pedido: {transfer_id}")
+        if not os.path.isdir(sip_directory):
+            continue
+        
+        for filename in os.listdir(sip_directory):
+            original_file_path = os.path.join(sip_directory, filename)
+            if not os.path.isfile(original_file_path):
+                continue
+            
+            print(f"   -> Processando arquivo: {filename}")
+            
+            checksum = calculate_checksum(original_file_path)
+            formato = identify_format_by_extension(filename)
+            
+            print(f"       - Checksum (Original): {checksum}")
+            print(f"       - Formato: {formato}")
+
+            normalized_file_path = None
+            if formato in DOCUMENT_FORMATS_TO_CONVERT:
+                normalized_file_path = normalize_to_pdfa(original_file_path, NORMALIZED_OUTPUT_DIR)
+            
+            if not checksum:
+                continue
+
+            # Payload para o Mapoteca (sem alterações)
+            payload_para_mapoteca = {
+                "transferId": transfer_id,
+                "original": { "nome": filename, "caminho": original_file_path, "checksum": checksum, "formato": formato },
+                "preservacao": {
+                    "nome": os.path.basename(normalized_file_path) if normalized_file_path else None,
+                    "caminho": normalized_file_path,
+                    "checksum": calculate_checksum(normalized_file_path) if normalized_file_path else None,
+                    "formato": "pdf/a" if normalized_file_path else None
+                }
+            }
+            
+            # Payload para o Gestão de Dados (NOVO FORMATO com listas separadas)
+            arquivo_original_data = {
+                "nome": filename,
+                "caminho_minio": f"originals/{transfer_id}/{filename}",
+                "checksum": checksum,
+                "formato": formato,
+            }
+            
+            payload_para_gestao = {
+                "transfer_id": transfer_id,
+                "originais": [arquivo_original_data],
+                "preservados": []
+            }
+
+            if normalized_file_path:
+                checksum_preservacao = calculate_checksum(normalized_file_path)
+                arquivo_preservado_data = {
+                    "nome": os.path.basename(normalized_file_path),
+                    "caminho_minio": f"preservation/{transfer_id}/{os.path.basename(normalized_file_path)}",
+                    "checksum": checksum_preservacao,
+                    "formato": "pdf/a",
+                }
+                payload_para_gestao["preservados"].append(arquivo_preservado_data)
+
+            # Chamar as duas funções de notificação
+            enviar_metadados_para_gestao(payload_para_gestao)
+            notificar_mapoteca(payload_para_mapoteca)
+
+        print(f"[*] Processamento do pedido {transfer_id} concluído.")
+
+    except Exception as e:
+        print(f"ERRO inesperado no loop principal: {e}")
