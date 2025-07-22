@@ -6,6 +6,8 @@ import subprocess
 import requests
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
+import re
+import unicodedata
 
 # --- Configurações ---
 KAFKA_BROKER = os.environ.get('KAFKA_BROKER', 'kafka:29092')
@@ -26,6 +28,13 @@ DOCUMENT_FORMATS_TO_CONVERT = ['pdf', 'doc', 'docx', 'odt', 'txt', 'xml', 'rtf']
 print("--- Microsserviço de Processamento ---")
 
 # --- Funções Auxiliares ---
+def sanitize_filename(filename):
+    normalized_name = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode('utf-8')
+    sanitized_name = re.sub(r'[^\w\s.-]', '', normalized_name).strip()
+    sanitized_name = re.sub(r'[-\s]+', '_', sanitized_name)
+    sanitized_name = re.sub(r'\.+', '.', sanitized_name)
+    return sanitized_name
+
 def calculate_checksum(file_path):
     sha256_hash = hashlib.sha256()
     try:
@@ -41,17 +50,43 @@ def identify_format_by_extension(filename):
     extension = os.path.splitext(filename)[1].lower()
     return EXTENSION_MAP.get(extension, 'outro')
 
+# ALTERAÇÃO: Função de normalização agora passa o caminho completo do arquivo de saída
 def normalize_to_pdfa(file_path, output_dir):
     try:
-        print(f"       - Normalizando documento para PDF/A...")
-        command = ["libreoffice", "--headless", "--convert-to", "pdf:writer_pdf_Export:SelectPdfVersion=1", "--outdir", output_dir, file_path]
-        subprocess.run(command, check=True, timeout=90, capture_output=True, text=True)
+        print(f"       - Normalizando documento para PDF com unoconv...")
+        
+        # Constrói o caminho completo e o nome do arquivo de saída desejado
         base_name = os.path.splitext(os.path.basename(file_path))[0] + ".pdf"
-        normalized_path = os.path.join(output_dir, base_name)
-        print(f"       - SUCESSO: Documento normalizado salvo como: {normalized_path}")
-        return normalized_path
+        output_filepath = os.path.join(output_dir, base_name)
+        
+        # Comando agora é explícito sobre onde salvar o arquivo
+        command = [
+            "unoconv",
+            "-f", "pdf",
+            "-o", output_filepath, # Passa o caminho completo do arquivo de saída
+            file_path
+        ]
+        
+        result = subprocess.run(
+            command, 
+            check=True, 
+            timeout=120, 
+            capture_output=True, 
+            text=True,
+            encoding='utf-8'
+        )
+        
+        if not os.path.exists(output_filepath):
+             raise FileNotFoundError(f"unoconv executou mas não criou o arquivo de saída. STDERR: {result.stderr}")
+
+        print(f"       - SUCESSO: Documento normalizado salvo como: {output_filepath}")
+        return output_filepath
+        
+    except subprocess.CalledProcessError as e:
+        print(f"       ERRO no subprocesso do unoconv: STDERR: {e.stderr}")
+        return None
     except Exception as e:
-        print(f"       ERRO ao normalizar para PDF/A: {e}")
+        print(f"       ERRO GERAL ao normalizar com unoconv: {e}")
         return None
 
 def notificar_mapoteca(metadados: dict):
@@ -108,42 +143,53 @@ for message in consumer:
         if not os.path.isdir(sip_directory):
             continue
         
-        for filename in os.listdir(sip_directory):
-            original_file_path = os.path.join(sip_directory, filename)
+        for original_filename in os.listdir(sip_directory):
+            original_file_path = os.path.join(sip_directory, original_filename)
             if not os.path.isfile(original_file_path):
                 continue
             
-            print(f"   -> Processando arquivo: {filename}")
+            sanitized_filename = sanitize_filename(original_filename)
+            sanitized_file_path = os.path.join(sip_directory, sanitized_filename)
             
-            checksum = calculate_checksum(original_file_path)
-            formato = identify_format_by_extension(filename)
+            if original_file_path != sanitized_file_path:
+                os.rename(original_file_path, sanitized_file_path)
+            
+            print(f"   -> Processando arquivo: {original_filename} (como {sanitized_filename})")
+            
+            checksum = calculate_checksum(sanitized_file_path)
+            formato = identify_format_by_extension(sanitized_filename)
             
             print(f"       - Checksum (Original): {checksum}")
             print(f"       - Formato: {formato}")
 
             normalized_file_path = None
             if formato in DOCUMENT_FORMATS_TO_CONVERT:
-                normalized_file_path = normalize_to_pdfa(original_file_path, NORMALIZED_OUTPUT_DIR)
+                normalized_file_path = normalize_to_pdfa(sanitized_file_path, NORMALIZED_OUTPUT_DIR)
             
             if not checksum:
                 continue
 
-            # Payload para o Mapoteca (sem alterações)
             payload_para_mapoteca = {
                 "transferId": transfer_id,
-                "original": { "nome": filename, "caminho": original_file_path, "checksum": checksum, "formato": formato },
+                "original": { 
+                    "nome": sanitized_filename, 
+                    "nomeOriginal": original_filename,
+                    "caminho": sanitized_file_path, 
+                    "checksum": checksum, 
+                    "formato": formato 
+                },
                 "preservacao": {
                     "nome": os.path.basename(normalized_file_path) if normalized_file_path else None,
                     "caminho": normalized_file_path,
                     "checksum": calculate_checksum(normalized_file_path) if normalized_file_path else None,
-                    "formato": "pdf/a" if normalized_file_path else None
+                    "formato": "pdf" if normalized_file_path else None
                 }
             }
             
-            # Payload para o Gestão de Dados (NOVO FORMATO com listas separadas)
             arquivo_original_data = {
-                "nome": filename,
-                "caminho_minio": f"originals/{transfer_id}/{filename}",
+                "nome": sanitized_filename,
+                "nome_original": original_filename,
+                "caminho_minio": f"originals/{transfer_id}/{sanitized_filename}",
                 "checksum": checksum,
                 "formato": formato,
             }
@@ -160,11 +206,10 @@ for message in consumer:
                     "nome": os.path.basename(normalized_file_path),
                     "caminho_minio": f"preservation/{transfer_id}/{os.path.basename(normalized_file_path)}",
                     "checksum": checksum_preservacao,
-                    "formato": "pdf/a",
+                    "formato": "pdf",
                 }
                 payload_para_gestao["preservados"].append(arquivo_preservado_data)
 
-            # Chamar as duas funções de notificação
             enviar_metadados_para_gestao(payload_para_gestao)
             notificar_mapoteca(payload_para_mapoteca)
 
