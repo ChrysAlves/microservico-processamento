@@ -17,6 +17,7 @@ NORMALIZED_OUTPUT_DIR = '/app/output_normalizado'
 SIP_LOCATION_INSIDE_CONTAINER = '/app/temp_ingestao_sip'
 MAPOTECA_SERVICE_URL = "http://mapoteca_app:3000/internal/processing-complete"
 GESTAO_DADOS_URL = "http://gestao_dados_app:8000"
+STORAGE_SERVICE_URL = "http://storage_app:3003/storage/upload"
 
 EXTENSION_MAP = {
     '.pdf': 'pdf', '.doc': 'doc', '.docx': 'docx', '.odt': 'odt',
@@ -50,43 +51,35 @@ def identify_format_by_extension(filename):
     extension = os.path.splitext(filename)[1].lower()
     return EXTENSION_MAP.get(extension, 'outro')
 
-# ALTERAÇÃO: Função de normalização agora passa o caminho completo do arquivo de saída
 def normalize_to_pdfa(file_path, output_dir):
     try:
         print(f"       - Normalizando documento para PDF com unoconv...")
-        
-        # Constrói o caminho completo e o nome do arquivo de saída desejado
-        base_name = os.path.splitext(os.path.basename(file_path))[0] + ".pdf"
-        output_filepath = os.path.join(output_dir, base_name)
-        
-        # Comando agora é explícito sobre onde salvar o arquivo
-        command = [
-            "unoconv",
-            "-f", "pdf",
-            "-o", output_filepath, # Passa o caminho completo do arquivo de saída
-            file_path
-        ]
-        
-        result = subprocess.run(
-            command, 
-            check=True, 
-            timeout=120, 
-            capture_output=True, 
-            text=True,
-            encoding='utf-8'
-        )
-        
+        output_filepath = os.path.join(output_dir, os.path.splitext(os.path.basename(file_path))[0] + ".pdf")
+        command = ["unoconv", "-f", "pdf", "-o", output_filepath, file_path]
+        result = subprocess.run(command, check=True, timeout=120, capture_output=True, text=True, encoding='utf-8')
         if not os.path.exists(output_filepath):
              raise FileNotFoundError(f"unoconv executou mas não criou o arquivo de saída. STDERR: {result.stderr}")
-
         print(f"       - SUCESSO: Documento normalizado salvo como: {output_filepath}")
         return output_filepath
-        
     except subprocess.CalledProcessError as e:
         print(f"       ERRO no subprocesso do unoconv: STDERR: {e.stderr}")
         return None
     except Exception as e:
         print(f"       ERRO GERAL ao normalizar com unoconv: {e}")
+        return None
+
+def enviar_para_storage(file_path, bucket, key):
+    try:
+        print(f"       -> Enviando '{key}' para o bucket '{bucket}'...")
+        with open(file_path, 'rb') as f:
+            files = {'file': (os.path.basename(key), f)}
+            data = {'bucket': bucket, 'key': key}
+            response = requests.post(STORAGE_SERVICE_URL, files=files, data=data, timeout=30)
+            response.raise_for_status()
+            print(f"       -> SUCESSO: Arquivo enviado para o storage.")
+            return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"       -> ERRO: Falha ao enviar arquivo para o storage: {e}")
         return None
 
 def notificar_mapoteca(metadados: dict):
@@ -137,9 +130,10 @@ for message in consumer:
     try:
         data = message.value
         transfer_id = data.get('transferId')
+        ra = data.get('ra', 'sem-ra')
         sip_directory = os.path.join(SIP_LOCATION_INSIDE_CONTAINER, transfer_id)
         
-        print(f"\n[*] Nova tarefa! Processando pedido: {transfer_id}")
+        print(f"\n[*] Nova tarefa! Processando pedido: {transfer_id} para o RA: {ra}")
         if not os.path.isdir(sip_directory):
             continue
         
@@ -169,27 +163,24 @@ for message in consumer:
             if not checksum:
                 continue
 
+            # ALTERAÇÃO: Monta os caminhos do Minio com a estrutura {RA}/{nome_do_arquivo}
+            caminho_minio_original = f"{ra}/{sanitized_filename}"
+            caminho_minio_preservacao = f"{ra}/{os.path.basename(normalized_file_path)}" if normalized_file_path else None
+
+            enviar_para_storage(sanitized_file_path, 'originals', caminho_minio_original)
+            if normalized_file_path:
+                enviar_para_storage(normalized_file_path, 'preservation', caminho_minio_preservacao)
+
             payload_para_mapoteca = {
                 "transferId": transfer_id,
-                "original": { 
-                    "nome": sanitized_filename, 
-                    "nomeOriginal": original_filename,
-                    "caminho": sanitized_file_path, 
-                    "checksum": checksum, 
-                    "formato": formato 
-                },
-                "preservacao": {
-                    "nome": os.path.basename(normalized_file_path) if normalized_file_path else None,
-                    "caminho": normalized_file_path,
-                    "checksum": calculate_checksum(normalized_file_path) if normalized_file_path else None,
-                    "formato": "pdf" if normalized_file_path else None
-                }
+                "status": "COMPLETED" if normalized_file_path else "FAILED",
+                "message": "" if normalized_file_path else "Falha na normalização do arquivo."
             }
             
             arquivo_original_data = {
                 "nome": sanitized_filename,
                 "nome_original": original_filename,
-                "caminho_minio": f"originals/{transfer_id}/{sanitized_filename}",
+                "caminho_minio": caminho_minio_original,
                 "checksum": checksum,
                 "formato": formato,
             }
@@ -204,7 +195,7 @@ for message in consumer:
                 checksum_preservacao = calculate_checksum(normalized_file_path)
                 arquivo_preservado_data = {
                     "nome": os.path.basename(normalized_file_path),
-                    "caminho_minio": f"preservation/{transfer_id}/{os.path.basename(normalized_file_path)}",
+                    "caminho_minio": caminho_minio_preservacao,
                     "checksum": checksum_preservacao,
                     "formato": "pdf",
                 }
