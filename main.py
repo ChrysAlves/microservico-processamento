@@ -24,11 +24,10 @@ EXTENSION_MAP = {
     '.txt': 'txt', '.xml': 'xml', '.rtf': 'rtf', '.jpg': 'jpg',
     '.jpeg': 'jpg', '.png': 'png', '.gif': 'gif', '.dwg': 'dwg',
 }
-DOCUMENT_FORMATS_TO_CONVERT = ['pdf', 'doc', 'docx', 'odt', 'txt', 'xml', 'rtf']
+DOCUMENT_FORMATS_TO_CONVERT = ['pdf', 'doc', 'docx', 'odt', 'txt', 'xml', 'rtf', 'jpg', 'jpeg', 'png', 'gif', 'dwg']
 
 print("--- Microsserviço de Processamento ---")
 
-# --- Funções Auxiliares ---
 def sanitize_filename(filename):
     normalized_name = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode('utf-8')
     sanitized_name = re.sub(r'[^\w\s.-]', '', normalized_name).strip()
