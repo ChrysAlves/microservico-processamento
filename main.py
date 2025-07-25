@@ -162,13 +162,12 @@ for message in consumer:
             if not checksum:
                 continue
 
-            # ALTERAÇÃO: Monta os caminhos do Minio com a estrutura {RA}/{nome_do_arquivo}
             caminho_minio_original = f"{ra}/{sanitized_filename}"
             caminho_minio_preservacao = f"{ra}/{os.path.basename(normalized_file_path)}" if normalized_file_path else None
 
-            enviar_para_storage(sanitized_file_path, 'originals', caminho_minio_original)
+            enviar_para_storage(sanitized_file_path, 'originais', caminho_minio_original)
             if normalized_file_path:
-                enviar_para_storage(normalized_file_path, 'preservation', caminho_minio_preservacao)
+                enviar_para_storage(normalized_file_path, 'preservacoes', caminho_minio_preservacao)
 
             payload_para_mapoteca = {
                 "transferId": transfer_id,

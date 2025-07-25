@@ -2,12 +2,12 @@
 
 ## 📋 Visão Geral
 
-O **Microsserviço de Processamento** é o "Departamento de Qualidade e Montagem" da arquitetura de preservação digital. Ele atua como o operário especializado que transforma as caixas originais (SIPs - Submission Information Packages) em caixas perfeitamente preservadas (AIPs - Archival Information Packages).
+O **Microsserviço de Processamento** é o "Departamento de Qualidade e Montagem" da arquitetura de preservações digital. Ele atua como o operário especializado que transforma as caixas originais (SIPs - Submission Information Packages) em caixas perfeitamente preservadas (AIPs - Archival Information Packages).
 
 ### Função Principal
 - Recebe SIPs através do Kafka
 - Processa e valida arquivos digitais
-- Normaliza documentos para formatos de preservação (PDF/A)
+- Normaliza documentos para formatos de preservações (PDF/A)
 - Calcula checksums para integridade
 - Cria AIPs estruturados
 - Envia metadados para o sistema de gestão
@@ -69,13 +69,13 @@ Front-End → Middleware → Mapoteca → Ingestão → [KAFKA] → PROCESSAMENT
 3. **Normalização**
    - Converte documentos para PDF usando LibreOffice/unoconv
    - Mantém arquivos originais intactos
-   - Gera versões de preservação
+   - Gera versões de preservações
 
 4. **Armazenamento**
    ```
    Processamento → Storage (MinIO)
-   ├── Bucket 'originals': arquivos originais
-   └── Bucket 'preservation': arquivos normalizados
+   ├── Bucket 'originais': arquivos originais
+   └── Bucket 'preservações': arquivos normalizados
    ```
 
 5. **Registro de Metadados**
@@ -194,13 +194,13 @@ microservico-processamento/
 - Conversão para PDF usando LibreOffice
 - Timeout de 120 segundos por arquivo
 - Tratamento de erros robusto
-- Preservação do arquivo original
+- preservações do arquivo original
 
 ### 5. Organização no Storage
 - **Estrutura**: `{RA}/{nome_arquivo}`
 - **Buckets separados**: 
-  - `originals`: arquivos originais
-  - `preservation`: versões normalizadas
+  - `originais`: arquivos originais
+  - `preservações`: versões normalizadas
 
 ## 🔧 Monitoramento e Logs
 

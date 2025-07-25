@@ -24,5 +24,4 @@ RUN mkdir -p /app/output_normalizado
 
 COPY . .
 
-# Voltamos a chamar o python diretamente
 CMD ["python3", "-u", "main.py"]
